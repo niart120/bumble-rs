@@ -1,4 +1,7 @@
-use crate::{Error, PacketFramer, PacketSink, PacketSource, Result, MAX_HCI_PACKET_SIZE};
+use crate::{
+    Error, PacketFramer, PacketSink, PacketSource, PacketSourceShutdown, Result,
+    MAX_HCI_PACKET_SIZE,
+};
 use bumble_hci::{
     HciPacket, HCI_ACL_DATA_PACKET, HCI_COMMAND_PACKET, HCI_EVENT_PACKET, HCI_ISO_DATA_PACKET,
     HCI_SYNCHRONOUS_DATA_PACKET,
@@ -378,6 +381,17 @@ pub struct UsbTransport<B> {
     product_id: u16,
     bus: u8,
     address: u8,
+    reader_shutdown: Arc<AtomicBool>,
+}
+
+struct UsbReaderShutdown {
+    requested: Arc<AtomicBool>,
+}
+
+impl PacketSourceShutdown for UsbReaderShutdown {
+    fn request_shutdown(&self) {
+        self.requested.store(true, Ordering::Release);
+    }
 }
 
 impl<B> UsbTransport<B> {
@@ -413,6 +427,7 @@ impl<B> UsbTransport<B> {
             product_id,
             bus,
             address,
+            reader_shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -537,15 +552,27 @@ impl<B: UsbIo> UsbTransport<B> {
 
 impl<B: UsbIo> PacketSource for UsbTransport<B> {
     fn read_packet(&mut self) -> Result<Option<HciPacket>> {
+        if self.reader_shutdown.load(Ordering::Acquire) {
+            return Ok(None);
+        }
         if let Some(packet) = self.pending.pop_front() {
             return Ok(Some(packet));
         }
         loop {
             self.poll_next_endpoint()?;
+            if self.reader_shutdown.load(Ordering::Acquire) {
+                return Ok(None);
+            }
             if let Some(packet) = self.pending.pop_front() {
                 return Ok(Some(packet));
             }
         }
+    }
+
+    fn shutdown_handle(&self) -> Option<Arc<dyn PacketSourceShutdown>> {
+        Some(Arc::new(UsbReaderShutdown {
+            requested: self.reader_shutdown.clone(),
+        }))
     }
 }
 
@@ -1017,7 +1044,7 @@ impl SystemUsbTransport {
     }
 
     pub fn try_split(self) -> Result<(Self, Self)> {
-        let source = Self::from_backend_with_sco(
+        let mut source = Self::from_backend_with_sco(
             self.backend.clone(),
             self.layout,
             self.sco_layout,
@@ -1026,8 +1053,13 @@ impl SystemUsbTransport {
             self.bus,
             self.address,
         );
+        source.reader_shutdown = self.reader_shutdown.clone();
         Ok((source, self))
     }
+}
+
+fn serial_matches(expected: &str, actual: Result<String>) -> Result<bool> {
+    Ok(actual? == expected)
 }
 
 fn select_device<T: UsbContext>(
@@ -1062,15 +1094,11 @@ fn select_device<T: UsbContext>(
                     continue;
                 }
                 if let Some(expected) = serial_number {
-                    let Ok(handle) = device.open() else {
-                        continue;
-                    };
-                    if handle
+                    let handle = device.open()?;
+                    let actual = handle
                         .read_serial_number_string_ascii(&descriptor)
-                        .ok()
-                        .as_deref()
-                        != Some(expected.as_str())
-                    {
+                        .map_err(Error::from);
+                    if !serial_matches(expected, actual)? {
                         continue;
                     }
                 }
@@ -1145,7 +1173,8 @@ fn interface_infos<T: UsbContext>(device: &Device<T>) -> Result<Vec<UsbInterface
 
 #[cfg(test)]
 mod tests {
-    use super::isochronous_packet_lengths;
+    use super::{isochronous_packet_lengths, serial_matches};
+    use crate::Error;
 
     #[test]
     fn isochronous_output_splits_at_endpoint_boundaries() {
@@ -1156,5 +1185,12 @@ mod tests {
             Vec::<usize>::new()
         );
         assert!(isochronous_packet_lengths(1, 0).is_err());
+    }
+
+    #[test]
+    fn serial_selector_preserves_open_or_read_failure() {
+        let error = serial_matches("expected", Err::<String, Error>(rusb::Error::Access.into()))
+            .unwrap_err();
+        assert!(matches!(error, Error::Usb(rusb::Error::Access)));
     }
 }

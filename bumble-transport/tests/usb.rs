@@ -6,6 +6,7 @@ use bumble_transport::{
 };
 use rusb::{Direction, TransferType};
 use std::collections::VecDeque;
+use std::sync::mpsc;
 use std::time::Duration;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -382,4 +383,81 @@ fn usb_transport_propagates_disconnects() {
         .push_back(Err(UsbTransferError::Disconnected));
     let mut transport = UsbTransport::from_backend(backend, layout(), 0, 0, 0, 0);
     assert!(transport.read_packet().is_err());
+}
+
+struct NotifyingTimeoutUsbIo {
+    first_read: Option<mpsc::Sender<()>>,
+}
+
+impl UsbIo for NotifyingTimeoutUsbIo {
+    fn read_interrupt(
+        &mut self,
+        _endpoint: u8,
+        _buffer: &mut [u8],
+        _timeout: Duration,
+    ) -> core::result::Result<usize, UsbTransferError> {
+        if let Some(first_read) = self.first_read.take() {
+            first_read.send(()).unwrap();
+        }
+        Err(UsbTransferError::Timeout)
+    }
+
+    fn read_bulk(
+        &mut self,
+        _endpoint: u8,
+        _buffer: &mut [u8],
+        _timeout: Duration,
+    ) -> core::result::Result<usize, UsbTransferError> {
+        Err(UsbTransferError::Timeout)
+    }
+
+    fn write_control(
+        &mut self,
+        _request_type: u8,
+        _request: u8,
+        _value: u16,
+        _index: u16,
+        buffer: &[u8],
+        _timeout: Duration,
+    ) -> core::result::Result<usize, UsbTransferError> {
+        Ok(buffer.len())
+    }
+
+    fn write_bulk(
+        &mut self,
+        _endpoint: u8,
+        buffer: &[u8],
+        _timeout: Duration,
+    ) -> core::result::Result<usize, UsbTransferError> {
+        Ok(buffer.len())
+    }
+}
+
+#[test]
+fn usb_reader_shutdown_interrupts_the_bounded_read_loop() {
+    let (first_read_tx, first_read_rx) = mpsc::channel();
+    let mut transport = UsbTransport::from_backend(
+        NotifyingTimeoutUsbIo {
+            first_read: Some(first_read_tx),
+        },
+        layout(),
+        0,
+        0,
+        0,
+        0,
+    );
+    let shutdown = transport.shutdown_handle().unwrap();
+    let (reader_result_tx, reader_result_rx) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        reader_result_tx.send(transport.read_packet()).unwrap();
+    });
+
+    first_read_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    shutdown.request_shutdown();
+    assert!(reader_result_rx
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap()
+        .unwrap()
+        .is_none());
+    reader.join().unwrap();
 }

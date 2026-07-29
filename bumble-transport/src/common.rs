@@ -5,6 +5,7 @@ use bumble_hci::{
 use core::fmt;
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Read, Write};
+use std::sync::Arc;
 
 /// Largest H4 packet representable by the standard two-byte length fields.
 pub const MAX_HCI_PACKET_SIZE: usize = 1 + 4 + u16::MAX as usize;
@@ -23,6 +24,11 @@ pub enum Error {
     InvalidSpec(String),
     Remote(String),
     Unsupported(String),
+    ExternalHostFailure(Arc<Error>),
+    ReaderShutdownUnsupported,
+    ReaderStillRunning,
+    ReaderShutdownTimedOut,
+    ReaderPanicked,
     PacketTooLarge(usize),
     TruncatedPacket(usize),
 }
@@ -44,6 +50,15 @@ impl fmt::Display for Error {
             Self::InvalidSpec(message) => write!(formatter, "invalid transport spec: {message}"),
             Self::Remote(message) => write!(formatter, "remote transport error: {message}"),
             Self::Unsupported(feature) => write!(formatter, "unsupported transport: {feature}"),
+            Self::ExternalHostFailure(error) => write!(formatter, "{error}"),
+            Self::ReaderShutdownUnsupported => {
+                write!(formatter, "packet source does not support reader shutdown")
+            }
+            Self::ReaderStillRunning => write!(formatter, "transport reader is still running"),
+            Self::ReaderShutdownTimedOut => {
+                write!(formatter, "timed out waiting for transport reader shutdown")
+            }
+            Self::ReaderPanicked => write!(formatter, "transport reader thread panicked"),
             Self::PacketTooLarge(size) => write!(formatter, "HCI packet is too large: {size}"),
             Self::TruncatedPacket(size) => {
                 write!(
@@ -65,6 +80,7 @@ impl std::error::Error for Error {
             Self::GrpcTransport(error) => Some(error.as_ref()),
             Self::Usb(error) => Some(error),
             Self::WebSocket(error) => Some(error),
+            Self::ExternalHostFailure(error) => Some(error.as_ref()),
             _ => None,
         }
     }
@@ -235,9 +251,27 @@ impl PacketFramer {
     }
 }
 
+/// A thread-safe request that makes a blocking packet source return promptly.
+///
+/// Implementations must arrange for the corresponding [`PacketSource`] to
+/// observe the request between bounded reads. The source should then return
+/// `Ok(None)` after releasing any read-side resources.
+pub trait PacketSourceShutdown: Send + Sync {
+    fn request_shutdown(&self);
+}
+
 pub trait PacketSource {
     /// Read the next packet, or `None` after a clean end of stream.
     fn read_packet(&mut self) -> Result<Option<HciPacket>>;
+
+    /// Return a handle that can stop a blocking [`Self::read_packet`] call.
+    ///
+    /// Sources that complete without an external request may keep the default
+    /// `None`. A source used by a long-lived [`crate::ExternalHost`] should
+    /// provide a handle so the reader thread can be joined during shutdown.
+    fn shutdown_handle(&self) -> Option<Arc<dyn PacketSourceShutdown>> {
+        None
+    }
 }
 
 pub trait PacketSink {

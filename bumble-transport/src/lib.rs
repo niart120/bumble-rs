@@ -43,8 +43,8 @@ pub use android_netsim::{
 pub use bridge::{BridgeDirection, FilteredPacket, HciBridge, PacketFilter, PacketTrace};
 pub use command_channel::{CommandResponse, HciCommandChannel};
 pub use common::{
-    Error, H4Transport, PacketFramer, PacketLayout, PacketSink, PacketSource, Result,
-    MAX_HCI_PACKET_SIZE,
+    Error, H4Transport, PacketFramer, PacketLayout, PacketSink, PacketSource, PacketSourceShutdown,
+    Result, MAX_HCI_PACKET_SIZE,
 };
 pub use dispatch::{
     open_split_transport, open_transport, ExternalTransport, OpenedTransport, SplitOpenedTransport,

@@ -1,4 +1,6 @@
-use crate::{CommandResponse, Error, PacketSink, Result, SplitOpenedTransport};
+use crate::{
+    CommandResponse, Error, PacketSink, PacketSourceShutdown, Result, SplitOpenedTransport,
+};
 use bumble::keys::{Key, KeyStore, PairingKeys};
 use bumble::Address;
 use bumble_att::AttPdu;
@@ -23,6 +25,8 @@ use bumble_smp::{
 };
 use std::collections::VecDeque;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
+use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1365,7 +1369,7 @@ impl AttTransport for ExternalEattTransport<'_> {
 enum ReaderMessage {
     Packet(Box<HciPacket>),
     Ended,
-    Failed(String),
+    Failed(Error),
 }
 
 /// A host-side HCI adapter backed by an independently owned packet source and
@@ -1379,48 +1383,131 @@ enum ReaderMessage {
 pub struct ExternalHost {
     sink: Box<dyn PacketSink + Send>,
     receiver: Receiver<ReaderMessage>,
+    reader_shutdown: Option<Arc<dyn PacketSourceShutdown>>,
+    reader_completion: Receiver<()>,
+    reader_completion_observed: bool,
+    reader: Option<JoinHandle<()>>,
     pending: VecDeque<HciPacket>,
     device_command_queue: VecDeque<Command>,
     device_pending_command: Option<u16>,
     device_command_credit: bool,
     device_transport_loss_notified: bool,
     state: ExternalHostState,
+    failure: Option<Arc<Error>>,
 }
 
 impl ExternalHost {
     pub fn new(transport: SplitOpenedTransport) -> Self {
+        Self::new_with_activity_callback(transport, || {})
+    }
+
+    /// Start an external host and invoke `activity_callback` after each reader
+    /// message has been added to the host queue.
+    ///
+    /// The callback runs on the reader thread. It should only signal the
+    /// application event loop and return promptly.
+    pub fn new_with_activity_callback<F>(
+        transport: SplitOpenedTransport,
+        activity_callback: F,
+    ) -> Self
+    where
+        F: Fn() + Send + 'static,
+    {
         let (sender, receiver) = mpsc::channel();
+        let (completion_sender, reader_completion) = mpsc::channel();
         let mut source = transport.source;
-        std::thread::spawn(move || loop {
-            match source.read_packet() {
-                Ok(Some(packet)) => {
-                    if sender
-                        .send(ReaderMessage::Packet(Box::new(packet)))
-                        .is_err()
-                    {
-                        return;
-                    }
+        let reader_shutdown = source.shutdown_handle();
+        let reader = std::thread::spawn(move || {
+            loop {
+                let message = match source.read_packet() {
+                    Ok(Some(packet)) => ReaderMessage::Packet(Box::new(packet)),
+                    Ok(None) => ReaderMessage::Ended,
+                    Err(error) => ReaderMessage::Failed(error),
+                };
+                let terminal = matches!(message, ReaderMessage::Ended | ReaderMessage::Failed(_));
+                if sender.send(message).is_err() {
+                    break;
                 }
-                Ok(None) => {
-                    let _ = sender.send(ReaderMessage::Ended);
-                    return;
-                }
-                Err(error) => {
-                    let _ = sender.send(ReaderMessage::Failed(error.to_string()));
-                    return;
+                activity_callback();
+                if terminal {
+                    break;
                 }
             }
+            let _ = completion_sender.send(());
         });
         Self {
             sink: transport.sink,
             receiver,
+            reader_shutdown,
+            reader_completion,
+            reader_completion_observed: false,
+            reader: Some(reader),
             pending: VecDeque::new(),
             device_command_queue: VecDeque::new(),
             device_pending_command: None,
             device_command_credit: true,
             device_transport_loss_notified: false,
             state: ExternalHostState::Running,
+            failure: None,
         }
+    }
+
+    /// Ask the packet source to stop a blocking reader call.
+    pub fn request_reader_shutdown(&self) -> Result<()> {
+        let Some(reader) = self.reader.as_ref() else {
+            return Ok(());
+        };
+        if reader.is_finished() {
+            return Ok(());
+        }
+        let shutdown = self
+            .reader_shutdown
+            .as_ref()
+            .ok_or(Error::ReaderShutdownUnsupported)?;
+        shutdown.request_shutdown();
+        Ok(())
+    }
+
+    /// Wait until the reader has completed, returning `false` on timeout.
+    pub fn wait_for_reader_completion(&mut self, timeout: Duration) -> bool {
+        let Some(reader) = self.reader.as_ref() else {
+            return true;
+        };
+        if self.reader_completion_observed || reader.is_finished() {
+            self.reader_completion_observed = true;
+            return true;
+        }
+        match self.reader_completion.recv_timeout(timeout) {
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                self.reader_completion_observed = true;
+                true
+            }
+            Err(RecvTimeoutError::Timeout) => false,
+        }
+    }
+
+    /// Join a completed reader thread.
+    pub fn join_reader(&mut self) -> Result<()> {
+        let Some(reader) = self.reader.as_ref() else {
+            return Ok(());
+        };
+        if !self.reader_completion_observed && !reader.is_finished() {
+            return Err(Error::ReaderStillRunning);
+        }
+        self.reader
+            .take()
+            .expect("reader existence was checked")
+            .join()
+            .map_err(|_| Error::ReaderPanicked)
+    }
+
+    /// Request reader shutdown, wait for completion, and join the thread.
+    pub fn shutdown_reader(&mut self, timeout: Duration) -> Result<()> {
+        self.request_reader_shutdown()?;
+        if !self.wait_for_reader_completion(timeout) {
+            return Err(Error::ReaderShutdownTimedOut);
+        }
+        self.join_reader()
     }
 
     pub fn state(&self) -> &ExternalHostState {
@@ -1433,7 +1520,9 @@ impl ExternalHost {
         }
         match &self.state {
             ExternalHostState::Ended => return Ok(ExternalHostActivity::Ended),
-            ExternalHostState::Failed(message) => return Err(Error::Remote(message.clone())),
+            ExternalHostState::Failed(_) => {
+                return Err(self.failure_error("transport reader failed".into()))
+            }
             ExternalHostState::Running => {}
         }
         match self.receiver.recv_timeout(timeout) {
@@ -1527,9 +1616,8 @@ impl ExternalHost {
                         "transport ended before response to HCI command {expected_opcode:#06x}"
                     )));
                 }
-                Ok(ReaderMessage::Failed(message)) => {
-                    self.state = ExternalHostState::Failed(message.clone());
-                    return Err(Error::Remote(message));
+                Ok(ReaderMessage::Failed(error)) => {
+                    return Err(self.record_failure(error));
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     return Err(Error::Remote(format!(
@@ -1980,10 +2068,7 @@ impl ExternalHost {
                 self.state = ExternalHostState::Ended;
                 Ok(ExternalHostActivity::Ended)
             }
-            ReaderMessage::Failed(message) => {
-                self.state = ExternalHostState::Failed(message.clone());
-                Err(Error::Remote(message))
-            }
+            ReaderMessage::Failed(error) => Err(self.record_failure(error)),
         }
     }
 
@@ -2015,6 +2100,14 @@ impl ExternalHost {
 
     fn fail(&mut self, message: impl Into<String>) {
         self.state = ExternalHostState::Failed(message.into());
+        self.failure = None;
+    }
+
+    fn record_failure(&mut self, error: Error) -> Error {
+        let error = Arc::new(error);
+        self.state = ExternalHostState::Failed(error.to_string());
+        self.failure = Some(error.clone());
+        Error::ExternalHostFailure(error)
     }
 
     fn notify_device_transport_lost(&mut self, device: &mut Device) {
@@ -2029,10 +2122,13 @@ impl ExternalHost {
     }
 
     fn failure_error(&self, fallback: String) -> Error {
-        match &self.state {
-            ExternalHostState::Failed(message) => Error::Remote(message.clone()),
-            ExternalHostState::Ended => Error::Remote("transport has ended".into()),
-            ExternalHostState::Running => Error::Remote(fallback),
+        match (&self.state, &self.failure) {
+            (ExternalHostState::Failed(_), Some(error)) => {
+                Error::ExternalHostFailure(error.clone())
+            }
+            (ExternalHostState::Failed(message), None) => Error::Remote(message.clone()),
+            (ExternalHostState::Ended, _) => Error::Remote("transport has ended".into()),
+            (ExternalHostState::Running, _) => Error::Remote(fallback),
         }
     }
 
@@ -2051,10 +2147,31 @@ impl ExternalHost {
             .write_packet(&packet)
             .and_then(|()| self.sink.flush())
         {
-            self.fail(error.to_string());
+            let _ = self.record_failure(error);
             return false;
         }
         true
+    }
+}
+
+impl Drop for ExternalHost {
+    fn drop(&mut self) {
+        let can_join = match self.reader.as_ref() {
+            None => false,
+            Some(reader) if reader.is_finished() => true,
+            Some(_) => match self.reader_shutdown.as_ref() {
+                Some(shutdown) => {
+                    shutdown.request_shutdown();
+                    true
+                }
+                None => false,
+            },
+        };
+        if can_join {
+            if let Some(reader) = self.reader.take() {
+                let _ = reader.join();
+            }
+        }
     }
 }
 
@@ -2119,7 +2236,7 @@ impl HostTransport for ExternalHost {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{PacketSource, Result as TransportResult};
+    use crate::{PacketSource, PacketSourceShutdown, Result as TransportResult};
     use bumble::Address;
     use bumble_hci::{
         CustomPacket, Event, LeMetaEvent, HCI_AUTHENTICATION_REQUESTED_COMMAND,
@@ -2129,7 +2246,8 @@ mod tests {
     use bumble_host::{Device, DeviceEvent};
     use bumble_l2cap::{ControlFrame, L2capPdu, L2CAP_LE_SIGNALING_CID};
     use std::collections::BTreeMap;
-    use std::sync::{Arc, Mutex};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
 
     struct ScriptedSource(VecDeque<TransportResult<Option<HciPacket>>>);
 
@@ -2157,11 +2275,68 @@ mod tests {
         }
     }
 
-    struct FailingSink;
+    struct FailingWriteSink;
 
-    impl PacketSink for FailingSink {
+    impl PacketSink for FailingWriteSink {
         fn write_packet(&mut self, _packet: &HciPacket) -> TransportResult<()> {
-            Err(Error::Remote("write failed".into()))
+            Err(std::io::Error::other("write failed").into())
+        }
+    }
+
+    struct FailingFlushSink;
+
+    impl PacketSink for FailingFlushSink {
+        fn write_packet(&mut self, _packet: &HciPacket) -> TransportResult<()> {
+            Ok(())
+        }
+
+        fn flush(&mut self) -> TransportResult<()> {
+            Err(std::io::Error::other("flush failed").into())
+        }
+    }
+
+    #[derive(Clone)]
+    struct TestShutdown {
+        control: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl PacketSourceShutdown for TestShutdown {
+        fn request_shutdown(&self) {
+            let (requested, wake) = &*self.control;
+            *requested.lock().unwrap() = true;
+            wake.notify_all();
+        }
+    }
+
+    struct ControlledSource {
+        control: Arc<(Mutex<bool>, Condvar)>,
+        started: Option<std::sync::mpsc::Sender<()>>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl PacketSource for ControlledSource {
+        fn read_packet(&mut self) -> TransportResult<Option<HciPacket>> {
+            if let Some(started) = self.started.take() {
+                started.send(()).unwrap();
+            }
+            let (requested, wake) = &*self.control;
+            let mut requested = requested.lock().unwrap();
+            while !*requested {
+                requested = wake.wait(requested).unwrap();
+            }
+            Ok(None)
+        }
+
+        fn shutdown_handle(&self) -> Option<Arc<dyn PacketSourceShutdown>> {
+            Some(Arc::new(TestShutdown {
+                control: self.control.clone(),
+            }))
+        }
+    }
+
+    impl Drop for ControlledSource {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -2349,7 +2524,8 @@ mod tests {
 
         assert!(matches!(
             host.wait_for_device_activity(&mut device, Duration::from_secs(1)),
-            Err(Error::Remote(message)) if message.contains("read failed")
+            Err(Error::ExternalHostFailure(error))
+                if matches!(error.as_ref(), Error::Remote(message) if message.contains("read failed"))
         ));
         assert!(device.classic_connection(connection_handle).is_none());
         assert_eq!(
@@ -2369,7 +2545,8 @@ mod tests {
         assert!(device.take_device_events().is_empty());
         assert!(matches!(
             host.send_command(Command::Reset, Duration::from_secs(1)),
-            Err(Error::Remote(message)) if message.contains("read failed")
+            Err(Error::ExternalHostFailure(error))
+                if matches!(error.as_ref(), Error::Remote(message) if message.contains("read failed"))
         ));
     }
 
@@ -2532,32 +2709,126 @@ mod tests {
     }
 
     #[test]
-    fn preserves_reader_and_writer_failures() {
+    fn activity_callback_runs_after_reader_message_is_enqueued() {
+        let packet = HciPacket::Command(Command::Reset);
+        let transport = split(vec![packet.clone()], RecordingSink::default());
+        let (callback_seen_tx, callback_seen_rx) = std::sync::mpsc::channel();
+        let (callback_release_tx, callback_release_rx) = std::sync::mpsc::channel();
+        let callback_count = Arc::new(AtomicUsize::new(0));
+        let callback_count_for_reader = callback_count.clone();
+        let mut host = ExternalHost::new_with_activity_callback(transport, move || {
+            let callback_index = callback_count_for_reader.fetch_add(1, Ordering::SeqCst);
+            callback_seen_tx.send(callback_index).unwrap();
+            if callback_index == 0 {
+                callback_release_rx.recv().unwrap();
+            }
+        });
+
+        assert_eq!(
+            callback_seen_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            host.wait_for_activity(Duration::ZERO).unwrap(),
+            ExternalHostActivity::Packet
+        );
+        assert_eq!(host.drain_host_events(0), vec![packet]);
+        callback_release_tx.send(()).unwrap();
+        assert_eq!(
+            host.wait_for_activity(Duration::from_secs(1)).unwrap(),
+            ExternalHostActivity::Ended
+        );
+        assert_eq!(
+            callback_seen_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            1
+        );
+        assert_eq!(callback_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn shutdown_waits_for_reader_completion_and_joins_once() {
+        let control = Arc::new((Mutex::new(false), Condvar::new()));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let transport = SplitOpenedTransport {
+            source: Box::new(ControlledSource {
+                control,
+                started: Some(started_tx),
+                drops: drops.clone(),
+            }),
+            sink: Box::new(RecordingSink::default()),
+            metadata: BTreeMap::new(),
+        };
+        let mut host = ExternalHost::new(transport);
+
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        host.shutdown_reader(Duration::from_secs(1)).unwrap();
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+        host.shutdown_reader(Duration::from_secs(1)).unwrap();
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn preserves_typed_reader_write_and_flush_failures() {
         let read_transport = SplitOpenedTransport {
-            source: Box::new(ScriptedSource(VecDeque::from([Err(Error::Remote(
-                "read failed".into(),
-            ))]))),
+            source: Box::new(ScriptedSource(VecDeque::from([Err(
+                std::io::Error::other("read failed").into(),
+            )]))),
             sink: Box::new(RecordingSink::default()),
             metadata: BTreeMap::new(),
         };
         let mut host = ExternalHost::new(read_transport);
-        assert!(host.wait_for_activity(Duration::from_secs(1)).is_err());
+        let error = host.wait_for_activity(Duration::from_secs(1)).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::ExternalHostFailure(error)
+                if matches!(error.as_ref(), Error::Io(_))
+        ));
         assert_eq!(
             host.state(),
-            &ExternalHostState::Failed("remote transport error: read failed".into())
+            &ExternalHostState::Failed("transport I/O error: read failed".into())
         );
+        let error = host.wait_for_activity(Duration::ZERO).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::ExternalHostFailure(error)
+                if matches!(error.as_ref(), Error::Io(_))
+        ));
 
         let write_transport = SplitOpenedTransport {
             source: Box::new(ScriptedSource(VecDeque::new())),
-            sink: Box::new(FailingSink),
+            sink: Box::new(FailingWriteSink),
             metadata: BTreeMap::new(),
         };
         let mut host = ExternalHost::new(write_transport);
-        host.handle_command(0, Command::Reset);
-        assert_eq!(
-            host.state(),
-            &ExternalHostState::Failed("remote transport error: write failed".into())
-        );
+        let error = host
+            .send_command(Command::Reset, Duration::from_secs(1))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::ExternalHostFailure(error)
+                if matches!(error.as_ref(), Error::Io(_))
+        ));
+
+        let flush_transport = SplitOpenedTransport {
+            source: Box::new(ScriptedSource(VecDeque::new())),
+            sink: Box::new(FailingFlushSink),
+            metadata: BTreeMap::new(),
+        };
+        let mut host = ExternalHost::new(flush_transport);
+        let error = host
+            .send_command(Command::Reset, Duration::from_secs(1))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::ExternalHostFailure(error)
+                if matches!(error.as_ref(), Error::Io(_))
+        ));
     }
 
     #[test]
