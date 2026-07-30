@@ -15,11 +15,16 @@ fn enforces_global_window_and_releases_fifo_on_completion() {
     assert_eq!(queue.in_flight(), 2);
     assert_eq!(queue.connection_in_flight(1), 1);
     assert_eq!(queue.waiting(), 1);
+    assert_eq!(queue.connection_waiting(1), 1);
+    assert!(!queue.is_flushed(1));
+    assert!(queue.is_flushed(2));
 
     queue.on_packets_completed(1, 1).unwrap();
     assert_eq!(queue.completed(), 1);
     assert_eq!(queue.poll_ready(), Some("a2"));
     assert_eq!(queue.connection_in_flight(1), 1);
+    assert_eq!(queue.connection_waiting(1), 0);
+    assert!(queue.is_flushed(1));
     assert!(!queue.is_drained(1));
     queue.on_packets_completed(1, 2).unwrap();
     queue.on_packets_completed(1, 1).unwrap();

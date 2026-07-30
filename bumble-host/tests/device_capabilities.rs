@@ -505,6 +505,7 @@ fn reset_installs_version_compatible_masks_and_v2_packet_pools() {
         .iter()
         .all(|packet| usize::from(packet.data_total_length) <= 251));
     assert_eq!(device.acl_packets_pending(), 3);
+    assert!(!device.acl_output_is_flushed(connection_handle));
 
     transport
         .events
@@ -515,6 +516,8 @@ fn reset_installs_version_compatible_masks_and_v2_packet_pools() {
     assert!(device.poll(&mut transport));
     assert_eq!(transport.acl_packets.len(), 3);
     assert_eq!(device.acl_packets_pending(), 1);
+    assert!(device.acl_output_is_flushed(connection_handle));
+    assert!(!device.acl_output_is_drained(connection_handle));
     transport
         .events
         .push(HciPacket::Event(Event::NumberOfCompletedPackets {

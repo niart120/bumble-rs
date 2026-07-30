@@ -4732,6 +4732,12 @@ impl Device {
         self.acl_output_is_drained(connection_handle)
     }
 
+    /// Whether all host-side Classic ACL packets queued for this connection
+    /// have entered the controller's flow-control window.
+    pub fn classic_channel_output_is_flushed(&self, connection_handle: u16) -> bool {
+        self.acl_output_is_flushed(connection_handle)
+    }
+
     /// Whether all host-to-controller ACL packets queued for this connection
     /// have been acknowledged by controller flow control.
     pub fn acl_output_is_drained(&self, connection_handle: u16) -> bool {
@@ -4741,6 +4747,20 @@ impl Device {
             }
         }
         self.acl_packet_queue.is_drained(connection_handle)
+    }
+
+    /// Whether all host-side ACL packets queued for this connection have
+    /// entered the controller's flow-control window.
+    ///
+    /// Unlike [`Self::acl_output_is_drained`], this does not wait for
+    /// `Number Of Completed Packets` credit for packets already in flight.
+    pub fn acl_output_is_flushed(&self, connection_handle: u16) -> bool {
+        if self.le_connections.contains_key(&connection_handle) {
+            if let Some(queue) = self.le_acl_packet_queue.as_ref() {
+                return queue.is_flushed(connection_handle);
+            }
+        }
+        self.acl_packet_queue.is_flushed(connection_handle)
     }
 
     pub fn take_classic_channel_errors(&mut self) -> Vec<(u16, String)> {

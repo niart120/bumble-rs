@@ -146,6 +146,15 @@ impl<T> DataPacketQueue<T> {
         self.packets.len()
     }
 
+    /// Return packets for one connection that have not yet entered the
+    /// controller's flow-control window.
+    pub fn connection_waiting(&self, connection_handle: u16) -> usize {
+        self.packets
+            .iter()
+            .filter(|(_, handle)| *handle == connection_handle)
+            .count()
+    }
+
     pub fn in_flight(&self) -> usize {
         self.in_flight
     }
@@ -162,10 +171,14 @@ impl<T> DataPacketQueue<T> {
     }
 
     pub fn is_drained(&self, connection_handle: u16) -> bool {
-        self.connection_in_flight(connection_handle) == 0
-            && !self
-                .packets
-                .iter()
-                .any(|(_, handle)| *handle == connection_handle)
+        self.connection_in_flight(connection_handle) == 0 && self.is_flushed(connection_handle)
+    }
+
+    /// Whether every packet for one connection has entered the controller's
+    /// flow-control window.
+    ///
+    /// In-flight packets can remain after this returns `true`.
+    pub fn is_flushed(&self, connection_handle: u16) -> bool {
+        self.connection_waiting(connection_handle) == 0
     }
 }
