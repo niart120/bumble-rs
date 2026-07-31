@@ -1372,6 +1372,25 @@ enum ReaderMessage {
     Failed(Error),
 }
 
+#[derive(Clone, Copy)]
+enum DirectCommandMode {
+    Blocking,
+    WithoutResponse,
+}
+
+impl DirectCommandMode {
+    fn busy_message(self, op_code: u16) -> String {
+        match self {
+            Self::Blocking => format!(
+                "cannot send blocking HCI command {op_code:#06x} while Device command flow is busy"
+            ),
+            Self::WithoutResponse => format!(
+                "cannot send HCI command {op_code:#06x} without a response while Device command flow is busy"
+            ),
+        }
+    }
+}
+
 /// A host-side HCI adapter backed by an independently owned packet source and
 /// sink.
 ///
@@ -1559,25 +1578,7 @@ impl ExternalHost {
     /// Command Status event. Unrelated asynchronous packets remain queued for
     /// the attached [`Device`].
     pub fn send_command(&mut self, command: Command, timeout: Duration) -> Result<CommandResponse> {
-        let expected_opcode = command.op_code();
-        if !matches!(self.state, ExternalHostState::Running) {
-            return Err(
-                self.failure_error(format!("failed to send HCI command {expected_opcode:#06x}"))
-            );
-        }
-        if self.device_pending_command.is_some()
-            || !self.device_command_queue.is_empty()
-            || !self.device_command_credit
-        {
-            return Err(Error::Remote(format!(
-                "cannot send blocking HCI command {expected_opcode:#06x} while Device command flow is busy"
-            )));
-        }
-        if !self.write(0, HciPacket::Command(command)) {
-            return Err(
-                self.failure_error(format!("failed to send HCI command {expected_opcode:#06x}"))
-            );
-        }
+        let expected_opcode = self.begin_direct_command(command, DirectCommandMode::Blocking)?;
         let deadline = Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1632,6 +1633,102 @@ impl ExternalHost {
                 }
             }
         }
+    }
+
+    /// Send one HCI command and wait for the first matching vendor event.
+    ///
+    /// Unmatched vendor events and unrelated packets remain queued for the
+    /// attached [`Device`]. The command is rejected while the device-managed
+    /// command flow is busy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the transport is unavailable, the device-managed
+    /// command flow is busy, the command cannot be written, no matching vendor
+    /// event arrives before `timeout`, or the reader terminates.
+    pub fn send_vendor_command<F>(
+        &mut self,
+        command: Command,
+        timeout: Duration,
+        mut matches_response: F,
+    ) -> Result<Vec<u8>>
+    where
+        F: FnMut(&[u8]) -> bool,
+    {
+        let expected_opcode = self.begin_direct_command(command, DirectCommandMode::Blocking)?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(Error::Remote(format!(
+                    "timed out waiting for vendor response to HCI command {expected_opcode:#06x}"
+                )));
+            }
+            match self.receiver.recv_timeout(remaining) {
+                Ok(ReaderMessage::Packet(packet)) => match *packet {
+                    HciPacket::Event(Event::Vendor { data }) if matches_response(&data) => {
+                        return Ok(data);
+                    }
+                    packet => self.pending.push_back(packet),
+                },
+                Ok(ReaderMessage::Ended) => {
+                    self.state = ExternalHostState::Ended;
+                    return Err(Error::Remote(format!(
+                        "transport ended before vendor response to HCI command {expected_opcode:#06x}"
+                    )));
+                }
+                Ok(ReaderMessage::Failed(error)) => {
+                    return Err(self.record_failure(error));
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    return Err(Error::Remote(format!(
+                        "timed out waiting for vendor response to HCI command {expected_opcode:#06x}"
+                    )));
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.state = ExternalHostState::Ended;
+                    return Err(Error::Remote(format!(
+                        "transport ended before vendor response to HCI command {expected_opcode:#06x}"
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Send one HCI command without waiting for a controller response.
+    ///
+    /// This is intended for commands that reset or otherwise make the
+    /// controller transport unavailable before a normal response can arrive.
+    /// The command is rejected while the device-managed command flow is busy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the transport is unavailable, the device-managed
+    /// command flow is busy, or the command cannot be written and flushed.
+    pub fn send_command_without_response(&mut self, command: Command) -> Result<()> {
+        self.begin_direct_command(command, DirectCommandMode::WithoutResponse)?;
+        Ok(())
+    }
+
+    fn begin_direct_command(&mut self, command: Command, mode: DirectCommandMode) -> Result<u16> {
+        let expected_opcode = command.op_code();
+        if !matches!(self.state, ExternalHostState::Running) {
+            return Err(
+                self.failure_error(format!("failed to send HCI command {expected_opcode:#06x}"))
+            );
+        }
+        if self.device_pending_command.is_some()
+            || !self.device_command_queue.is_empty()
+            || !self.device_command_credit
+        {
+            return Err(Error::Remote(mode.busy_message(expected_opcode)));
+        }
+        if !self.write(0, HciPacket::Command(command)) {
+            return Err(
+                self.failure_error(format!("failed to send HCI command {expected_opcode:#06x}"))
+            );
+        }
+        Ok(expected_opcode)
     }
 
     /// Reset and configure an external controller, then apply its distinct
@@ -2850,6 +2947,91 @@ mod tests {
             Some(0)
         );
         assert_eq!(host.drain_host_events(0), vec![unrelated]);
+    }
+
+    #[test]
+    fn external_host_vendor_command_waits_for_matching_event_and_preserves_others() {
+        let unrelated = HciPacket::Custom(CustomPacket::new(vec![0xAA, 0xBB]));
+        let unmatched = HciPacket::Event(Event::Vendor {
+            data: vec![0xC2, 0x01, 0x00, 0x00, 0x00, 0x12, 0x47],
+        });
+        let matched_data = vec![0xC2, 0x01, 0x00, 0x00, 0x00, 0x11, 0x47];
+        let sink = RecordingSink::default();
+        let recorded = sink.clone();
+        let mut host = ExternalHost::new(split(
+            vec![
+                unrelated.clone(),
+                unmatched.clone(),
+                HciPacket::Event(Event::Vendor {
+                    data: matched_data.clone(),
+                }),
+            ],
+            sink,
+        ));
+        let command = Command::Generic {
+            op_code: 0xFC00,
+            parameters: vec![0xC2, 0x02, 0x00, 0x00, 0x00, 0x11, 0x47],
+        };
+
+        let response = host
+            .send_vendor_command(command.clone(), Duration::from_secs(1), |data| {
+                data.get(5..7) == Some([0x11, 0x47].as_slice())
+            })
+            .unwrap();
+
+        assert_eq!(response, matched_data);
+        assert_eq!(
+            recorded.0.lock().unwrap().as_slice(),
+            &[HciPacket::Command(command)]
+        );
+        assert_eq!(host.drain_host_events(0), vec![unrelated, unmatched]);
+    }
+
+    #[test]
+    fn external_host_vendor_command_has_a_bounded_wait() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut host = ExternalHost::new(SplitOpenedTransport {
+            source: Box::new(ChannelSource(receiver)),
+            sink: Box::new(RecordingSink::default()),
+            metadata: BTreeMap::new(),
+        });
+
+        let error = host
+            .send_vendor_command(
+                Command::Generic {
+                    op_code: 0xFC00,
+                    parameters: vec![0xC2],
+                },
+                Duration::from_millis(1),
+                |_| false,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::Remote(message) if message == "timed out waiting for vendor response to HCI command 0xfc00"
+        ));
+        drop(sender);
+        assert!(host.wait_for_reader_completion(Duration::from_secs(1)));
+        host.join_reader().unwrap();
+    }
+
+    #[test]
+    fn external_host_can_send_a_command_without_waiting_for_a_response() {
+        let sink = RecordingSink::default();
+        let recorded = sink.clone();
+        let mut host = ExternalHost::new(split(Vec::new(), sink));
+        let command = Command::Generic {
+            op_code: 0xFC00,
+            parameters: vec![0xC2, 0x02, 0x00, 0x09],
+        };
+
+        host.send_command_without_response(command.clone()).unwrap();
+
+        assert_eq!(
+            recorded.0.lock().unwrap().as_slice(),
+            &[HciPacket::Command(command)]
+        );
     }
 
     #[test]
